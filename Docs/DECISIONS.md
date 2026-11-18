@@ -1,5 +1,17 @@
 # Nhật ký quyết định
 
+## 08/11/2026 — Mở rộng soạn đề Lab Test 4 dạng câu hỏi & đề mẫu tham khảo (QUIZ-01/02)
+
+- Hỗ trợ 4 dạng câu hỏi theo cấu trúc đề mẫu: `single_choice` (Phần I: 1 đáp án đúng), `multiple_choice` (Phần II: nhiều đáp án đúng `a|b|d`), `true_false` (Phần III: Đúng/Sai 4 mệnh đề `a:Đ|b:S|c:S|d:Đ`, hỗ trợ tiền tố `[0,1,2,...]` điều khiển thứ tự đảo mệnh đề khi sinh đề), và `short_answer` (Phần IV: trả lời ngắn).
+- Cho phép giảng viên mở và soạn câu hỏi/đáp án trực tiếp ngay tại mục Lab Test trên trang Cấu hình chương trình (`ClassCurriculumPage`) hoặc trang Ngân hàng câu hỏi (`QuestionBankPage`), tự động khởi tạo ngân hàng nếu lớp chưa lưu nháp lần đầu.
+- Bổ sung bộ đề mẫu tham khảo tải về (`/templates/labtest-sample-exam.txt`, `/templates/question-bank.xlsx`, `/templates/answer-sheet-sample.csv`) và hỗ trợ nhập câu hỏi từ tệp `.xlsx`, `.csv`, `.txt`/`.md`, `.json` hoặc dán trực tiếp văn bản đề mẫu.
+
+## 07/11/2026 — Nhập danh sách sinh viên hàng loạt từ Excel/CSV (CLASS-02)
+
+- Giữ nguyên chức năng thêm từng sinh viên bằng email (`POST /api/classes/{class_id}/members`) và bổ sung `POST /api/classes/{class_id}/members/import` (cùng mẫu tải về `/templates/class-students.xlsx`, `/templates/class-students.csv` và `GET /api/classes/templates/students?format=xlsx|csv`).
+- Cấu trúc mẫu gồm cột `email` (bắt buộc) và `full_name` (tùy chọn để giảng viên đối chiếu, không tự ý ghi đè họ tên tài khoản đã đăng ký). Hỗ trợ cả `.xlsx` và `.csv` (tối đa 1 MB, 500 dòng/lần, kiểm tra chống XML entity/zip bomb).
+- Xử lý theo từng dòng hợp lệ (theo lựa chọn của người yêu cầu): thêm mới hoặc khôi phục membership `student` cho các email đã có tài khoản `active` (kèm `audit_logs`), giữ nguyên sinh viên đang active, và trả về danh sách chi tiết các dòng bị bỏ qua (`NOT_REGISTERED`, `ACCOUNT_LOCKED`, `IS_TEACHER`, `INVALID_EMAIL`, `DUPLICATE_IN_FILE`, `EMPTY_EMAIL`).
+
 ## 26/10/2026 — Dashboard, migration, pilot (Sprint 5)
 
 - Cờ theo lớp (người yêu cầu chọn): `LMS_CLASS_MODE` vẫn là công tắc tổng; mỗi lớp có `lms_mode` = `enabled` | `read_only` | `off`, chỉ Admin đổi, bắt buộc lý do, có audit. Lớp mới và lớp có trước migration 0010 mặc định `enabled` để giữ hành vi đã chạy dưới cờ tổng.
@@ -55,3 +67,13 @@
 - UI giữ hệ thiết kế hiện có: navy #0a4174 cho thao tác, #0f172a chữ, #ffffff nội dung, #f8fafc nền phụ, #e2e8f0 đường phân chia, #b91c1c lỗi. Inter cho nhãn/nội dung, căn trái; câu hỏi có chiều rộng đọc vừa phải. GV dùng danh sách câu + form biên tập, SV dùng các lựa chọn lớn và thanh thời gian/trạng thái lưu luôn rõ. Không thêm hình trang trí hay animation vào màn hình thi.
 - Phác thảo: GV `[Lab / trạng thái / số đã duyệt] [danh sách câu | nội dung + duyệt]`; SV `[thời gian | đã lưu] [câu + 4 lựa chọn] [nộp bài]`. Đã đối chiếu với luồng học CubeSAT: ưu tiên nguồn tham chiếu, duyệt và trạng thái lưu hơn các thẻ thống kê chung chung.
 
+
+# 2026-11-11 — Cấu trúc lại Lab1, 3, 4, 6, 7 theo tổ chức PTITCube
+
+- Làm theo cấu trúc repo hiện tại của PTITCube. Lab 6 giữ lại chỉ với lắp ráp cơ khí vì không còn bài code nào trên GitHub; số Lab vẫn là 0–8.
+- Các repo "ví dụ cha" (Lab2-01, Lab3-01, Lab4-01 đến 04, Lab5-01/02) được thêm thành bài thực hành riêng, đứng đầu nhóm bài a/b tương ứng.
+- Đổi ID bài cũ sang ID mới bằng migration `0013_curriculum_restructure` (có downgrade). Tiến độ và bản nháp của `Lab2-01a_Battery_GPIO` chuyển sang `Lab2-01a_Battery_I2C`; nội dung bài vẫn là đo ADC.
+- Compiler vẫn ghim PTITCube-Library `218d2b6` kèm overrides. Thư viện upstream đã tiến tới `41f19ba` (EPS dùng MAX17048). Các sketch upstream đã đổi nhiều và cần thư viện mới được giữ ở bản local đã kiểm chứng, ghi rõ trong `notes` của `catalog.json`. Nâng thư viện và rebase overrides là việc riêng, chưa làm.
+- Bài mới từ upstream không thêm log Serial; panel trực quan chỉ hiện dữ liệu sketch tự in.
+- Video bài mới của Lab 1 để trống (TODO GV); tài liệu Doc 1.3 tóm lược từ README upstream.
+- Cập nhật cùng ngày: nhóm xác nhận kit vẫn đo pin bằng ADC qua cầu chia áp. Giữ PTITCube-Library `218d2b6` (không nâng lên `41f19ba`/MAX17048); `Lab2-01a_Battery_I2C` dùng lại bản ADC đã kiểm chứng, chỉ đổi ID theo tên repo.

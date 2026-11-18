@@ -1,11 +1,14 @@
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from sqlalchemy import func, select
 
 from app.models.learning import ProgressEvent
+from app.models.tables import UserRole
 from app.services.learning_rules import (
     BRANCHING,
     learning_path,
@@ -14,6 +17,7 @@ from app.services.learning_rules import (
     video_complete,
     watched_seconds,
 )
+from app.services.progress import ProgressService
 from app.tests import test_course_configuration as fixtures
 
 
@@ -79,18 +83,24 @@ class LearningRulesTests(unittest.TestCase):
         self.assertEqual(
             learning_path(config, {"doc-0": "pending_review"})["labs"][0]["percent"], 0
         )
-        self.assertEqual(learning_path(config, {"doc-0": "waived"})["labs"][0]["percent"], 100)
+        self.assertEqual(learning_path(config, {"doc-0": "waived"})["labs"][0]["percent"], 50)
+        self.assertEqual(
+            learning_path(config, {"doc-0": "waived", "optional": "completed"})["labs"][0][
+                "percent"
+            ],
+            100,
+        )
         self.assertEqual(
             learning_path(config, {"doc-0": "waived"}, allow_waivers=False)["labs"][0]["percent"], 0
         )
         self.assertEqual(
-            learning_path(config, {"doc-0": "completed"})["continue_lesson_id"], "doc-1"
+            learning_path(config, {"doc-0": "completed"})["continue_lesson_id"], "optional"
         )
         self.assertEqual(
-            learning_path(config, {"doc-0": "completed"}, last_lesson="optional")[
+            learning_path(config, {"doc-0": "completed", "optional": "completed"})[
                 "continue_lesson_id"
             ],
-            "optional",
+            "doc-1",
         )
         huge = deepcopy(config)
         huge["labs"][0]["lessons"] = [
@@ -101,6 +111,28 @@ class LearningRulesTests(unittest.TestCase):
         self.assertEqual(path["labs"][0]["percent"], 100)  # Display rounding must not unlock.
         self.assertFalse(path["labs"][0]["completed"])
         self.assertEqual(path["labs"][1]["access"], "locked")
+
+    def test_all_enabled_lessons_unlock_strictly_one_by_one(self):
+        config = small_config()
+        config["labs"][0]["lessons"] = [
+            {"id": "doc-0-1", "title": "Doc 1", "type": "document", "enabled": True, "required": True},
+            {"id": "prac-0-1", "title": "Practice 1", "type": "practice", "enabled": True, "required": False},
+            {"id": "prac-0-2", "title": "Practice 2", "type": "practice", "enabled": True, "required": False},
+            {"id": "doc-0-2", "title": "Doc 2", "type": "document", "enabled": True, "required": True},
+            {"id": "labtest-0", "title": "Lab Test 0", "type": "labtest", "enabled": True, "required": False},
+        ]
+        after_doc1 = learning_path(config, {"doc-0-1": "completed"})
+        self.assertEqual(
+            [item["access"] for item in after_doc1["labs"][0]["lessons"]],
+            ["completed", "available", "locked", "locked", "locked"],
+        )
+        self.assertEqual(after_doc1["labs"][1]["access"], "locked")
+
+        after_prac1 = learning_path(config, {"doc-0-1": "completed", "prac-0-1": "completed"})
+        self.assertEqual(
+            [item["access"] for item in after_prac1["labs"][0]["lessons"]],
+            ["completed", "completed", "available", "locked", "locked"],
+        )
 
     def test_segments_union_threshold_and_invalid_ranges(self):
         segments = merge_segments([], 0, 40, 100)
@@ -133,6 +165,188 @@ class LearningRulesTests(unittest.TestCase):
             "doc-0",
         )
 
+    def test_lessons_unlock_in_one_course_sequence(self):
+        config = small_config()
+        initial = learning_path(config, {})
+        self.assertEqual(initial["labs"][0]["lessons"][0]["access"], "available")
+        self.assertEqual(initial["labs"][1]["access"], "locked")
+        self.assertEqual(initial["labs"][1]["lessons"][0]["access"], "locked")
+
+        after_first = learning_path(config, {"doc-0": "completed"})
+        self.assertEqual(after_first["labs"][1]["access"], "available")
+        self.assertEqual(after_first["labs"][1]["lessons"][0]["access"], "available")
+        self.assertEqual(after_first["labs"][2]["lessons"][0]["access"], "locked")
+
+        staff_view = learning_path(config, {}, unlocked_all=True)
+        for lab in staff_view["labs"]:
+            self.assertEqual(lab["access"], "available")
+            for lesson in lab["lessons"]:
+                self.assertEqual(lesson["access"], "available")
+
+
+class LegacyProgressTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.db = SimpleNamespace(
+            commit=AsyncMock(),
+            refresh=AsyncMock(),
+        )
+        self.progress = SimpleNamespace(
+            lab_id=0,
+            video_watched=False,
+            doc_viewed=False,
+            compiled_at=None,
+            completed_at=None,
+            lesson_progress={},
+        )
+        self.user = SimpleNamespace(id=7, role=UserRole.user)
+        self.service = ProgressService(self.db)
+        self.service.repo = SimpleNamespace(
+            get_or_create=AsyncMock(return_value=self.progress),
+            list_by_user=AsyncMock(),
+        )
+        self.seed = {
+            "legacy": [
+                {
+                    "id": 0,
+                    "lessons": [
+                        {"id": "first"},
+                        {"id": "second"},
+                    ],
+                }
+            ]
+        }
+
+    async def test_start_lesson_persists_started_at(self):
+        with patch("app.services.progress.read_seed", return_value=self.seed):
+            result = await self.service.start_lesson(self.user, 0, "first")
+
+        self.assertIn("first", result.lessons)
+        self.assertFalse(result.lessons["first"]["completed"])
+        self.assertIsNotNone(result.lessons["first"]["started_at"])
+        self.db.commit.assert_awaited_once()
+
+    async def test_completion_before_one_minute_is_rejected(self):
+        self.progress.lesson_progress = {
+            "first": {
+                "started_at": (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(),
+                "completed": False,
+            }
+        }
+
+        with patch("app.services.progress.read_seed", return_value=self.seed):
+            with self.assertRaises(Exception) as context:
+                await self.service.complete_lesson(self.user, 0, "first")
+
+        self.assertEqual(context.exception.code, "MINIMUM_LEARNING_TIME")
+        self.assertFalse(self.progress.lesson_progress["first"]["completed"])
+        self.db.commit.assert_not_awaited()
+
+    async def test_previous_lesson_is_required(self):
+        self.progress.lesson_progress = {
+            "first": {
+                "started_at": (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+                "completed": False,
+            },
+            "second": {
+                "started_at": (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+                "completed": False,
+            },
+        }
+
+        with patch("app.services.progress.read_seed", return_value=self.seed):
+            with self.assertRaises(Exception) as context:
+                await self.service.complete_lesson(self.user, 0, "second")
+
+        self.assertEqual(context.exception.code, "PREREQUISITE_NOT_MET")
+        self.db.commit.assert_not_awaited()
+
+    async def test_final_lesson_marks_lab_complete(self):
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        self.progress.lesson_progress = {
+            "first": {"started_at": old, "completed": True},
+            "second": {"started_at": old, "completed": False},
+        }
+
+        with patch("app.services.progress.read_seed", return_value=self.seed):
+            result = await self.service.complete_lesson(self.user, 0, "second")
+
+        self.assertTrue(result.lessons["second"]["completed"])
+        self.assertIsNotNone(result.completed_at)
+        self.db.commit.assert_awaited_once()
+
+    async def test_reset_lesson_returns_to_incomplete_and_clears_lab_completion(self):
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        self.progress.completed_at = datetime.now(timezone.utc)
+        self.progress.lesson_progress = {
+            "first": {"started_at": old, "completed": True, "completed_at": old},
+            "second": {"started_at": old, "completed": True, "completed_at": old},
+        }
+
+        result = await self.service.reset_lesson(self.user, 0, "first")
+
+        self.assertFalse(result.lessons["first"]["completed"])
+        self.assertNotIn("completed_at", result.lessons["first"])
+        self.assertEqual(result.lessons["first"]["started_at"], old)
+        self.assertTrue(result.lessons["second"]["completed"])
+        self.assertIsNone(result.completed_at)
+        self.db.commit.assert_awaited_once()
+
+    async def test_reset_incomplete_lesson_is_noop(self):
+        self.progress.lesson_progress = {
+            "first": {"started_at": datetime.now(timezone.utc).isoformat(), "completed": False},
+        }
+
+        result = await self.service.reset_lesson(self.user, 0, "first")
+
+        self.assertFalse(result.lessons["first"]["completed"])
+        self.db.commit.assert_not_awaited()
+
+    async def test_teacher_can_complete_without_waiting(self):
+        self.user.role = UserRole.teacher
+        self.progress.lesson_progress = {
+            "first": {
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed": False,
+            }
+        }
+
+        with patch("app.services.progress.read_seed", return_value=self.seed):
+            result = await self.service.complete_lesson(self.user, 0, "first")
+
+        self.assertTrue(result.lessons["first"]["completed"])
+        self.db.commit.assert_awaited_once()
+
+    async def test_summary_lesson_can_complete_immediately_without_waiting(self):
+        seed_with_summary = {
+            "legacy": [
+                {
+                    "id": 1,
+                    "lessons": [
+                        {"id": "first", "type": "document"},
+                        {"id": "summary-1", "type": "summary"},
+                    ],
+                }
+            ]
+        }
+        self.progress.lab_id = 1
+        self.progress.lesson_progress = {
+            "first": {
+                "started_at": (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+                "completed": True,
+            },
+            "summary-1": {
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed": False,
+            },
+        }
+
+        with patch("app.services.progress.read_seed", return_value=seed_with_summary):
+            result = await self.service.complete_lesson(self.user, 1, "summary-1")
+
+        self.assertTrue(result.lessons["summary-1"]["completed"])
+        self.assertIsNotNone(result.completed_at)
+        self.db.commit.assert_awaited_once()
+
 
 class LearningAPITests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -143,9 +357,11 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
         self.base = f"/api/classes/{self.class_a}"
         self.body = fixtures.settings_payload(await self.fixture.draft())
         for item in self.body["lessons"]:
-            item["required"] = item["lesson_id"] == "document" or item["lesson_id"].startswith(
+            active = item["lesson_id"] == "document" or item["lesson_id"].startswith(
                 "summary-"
             )
+            item["enabled"] = active or item["lesson_id"] == "Lab2-01a_Battery_I2C"
+            item["required"] = active
             if item["lesson_id"] == "document":
                 item["params"] = {"markdown": "Hướng dẫn định hướng trong dữ liệu kiểm thử."}
         await self.apply(self.body)
@@ -171,9 +387,34 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
             {"idempotency_key": str(uuid4()), "kind": kind, **values},
         )
 
-    async def complete(self, lab):
-        result = await self.event("document" if lab == 0 else f"summary-{lab}")
+    async def complete_lesson(self, lesson):
+        from sqlalchemy import update
+
+        from app.models.learning import LessonProgress
+
+        result = await self.event(lesson, "opened")
         self.assertEqual(result.status_code, 200, result.text)
+        if result.json().get("status") != "completed":
+            async with self.sessions() as db:
+                await db.execute(
+                    update(LessonProgress)
+                    .where(LessonProgress.lesson_id == lesson)
+                    .values(started_at=datetime.now(timezone.utc) - timedelta(seconds=65))
+                )
+                await db.commit()
+            result = await self.event(lesson, "complete")
+            self.assertEqual(result.status_code, 200, result.text)
+
+    async def complete(self, lab):
+        lessons = (
+            ["document"]
+            if lab == 0
+            else ["Lab2-01a_Battery_I2C", "summary-2"]
+            if lab == 2
+            else [f"summary-{lab}"]
+        )
+        for lesson in lessons:
+            await self.complete_lesson(lesson)
 
     async def path(self):
         result = await self.call(4, "GET", self.base + "/learning-path")
@@ -181,11 +422,18 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
         return result.json()
 
     async def test_default_path_and_content_source_compile_gates(self):
-        self.assertEqual((await self.path())["labs"][1]["access"], "locked")
+        initial_path = await self.path()
+        self.assertEqual(initial_path["labs"][0]["lessons"][0]["access"], "available")
+        self.assertEqual(initial_path["labs"][1]["access"], "locked")
         content = (await self.call(4, "GET", self.base + "/curriculum")).json()
         self.assertNotIn("content", content["labs"][1]["lessons"][0])
-        self.assertEqual((await self.event("summary-1")).status_code, 403)
-        source = f"/api/curriculum/exercises/Lab2-01a_Battery_GPIO/source?class_id={self.class_a}"
+        locked_event = await self.event("summary-1")
+        self.assertEqual(locked_event.status_code, 403)
+        self.assertEqual(
+            locked_event.json()["message"],
+            "Bạn cần hoàn thành bài học trước để mở khóa bài này.",
+        )
+        source = f"/api/curriculum/exercises/Lab2-01a_Battery_I2C/source?class_id={self.class_a}"
         self.assertEqual((await self.call(4, "GET", source)).status_code, 403)
         with patch(
             "app.services.compiler_svc.compile_code", AsyncMock(return_value={"success": True})
@@ -194,7 +442,7 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
                 "code": "void setup() {} void loop() {}",
                 "lab_id": 2,
                 "class_id": self.class_a,
-                "lesson_id": "Lab2-01a_Battery_GPIO",
+                "lesson_id": "Lab2-01a_Battery_I2C",
             }
             self.assertEqual((await self.call(4, "POST", "/api/compile", payload)).status_code, 403)
             build.assert_not_called()
@@ -203,9 +451,10 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [path["labs"][i]["access"] for i in (1, 2)], ["available", "available"]
             )
+            self.assertEqual((await self.call(4, "POST", "/api/compile", payload)).status_code, 403)
+            await self.complete(1)
             self.assertEqual((await self.call(4, "POST", "/api/compile", payload)).status_code, 200)
             self.assertFalse((await self.path())["labs"][2]["completed"])
-        await self.complete(1)
         await self.complete(2)
         await self.complete(3)
         self.assertEqual((await self.path())["labs"][6]["access"], "locked")
@@ -302,9 +551,10 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
         body = deepcopy(self.body)
         for item in body["lessons"]:
             if item["lesson_id"] == "summary-1":
-                item["required"] = False
+                item.update(enabled=False, required=False)
             if item["lesson_id"] == "Lab1-01_Blink_LED":
                 item.update(
+                    enabled=True,
                     required=True,
                     params={
                         "instructions": "Bài thực hành kiểm thử.",
@@ -402,20 +652,54 @@ class LearningAPITests(unittest.IsolatedAsyncioTestCase):
         body = deepcopy(self.body)
         for item in body["lessons"]:
             if item["lesson_id"] == "document-2-1":
-                item["required"] = True
+                item.update(enabled=True, required=True)
         await self.apply(body)
         self.assertEqual((await self.path())["labs"][6]["access"], "locked")
         self.assertEqual(
             (await self.path())["labs"][1]["percent"], 100
         )  # Waiver survives configuration revisions.
+        await self.complete_lesson("document-2-1")
         await self.complete(2)
-        self.assertEqual((await self.path())["labs"][2]["percent"], 50)
+        self.assertEqual((await self.path())["labs"][2]["percent"], 100)
         body = deepcopy(self.body)
         for item in body["lessons"]:
             if item["lesson_id"] == "document-2-1":
                 item.update(enabled=False, required=False)
         await self.apply(body)
         self.assertEqual((await self.path())["labs"][2]["percent"], 100)
+
+    async def test_one_minute_completion_works_for_document_practice_and_labtest(self):
+        body = deepcopy(self.body)
+        for item in body["lessons"]:
+            if item["lesson_id"] in {"components", "labtest-0"}:
+                item.update(enabled=True, required=False)
+        await self.apply(body)
+
+        # Before completing "document", "components" and "labtest-0" are locked.
+        self.assertEqual((await self.event("components", "opened")).status_code, 403)
+        self.assertEqual((await self.event("labtest-0", "opened")).status_code, 403)
+
+        # Completing "document" after 1 minute unlocks "components" (practice), while "labtest-0" stays locked.
+        await self.complete_lesson("document")
+        self.assertEqual((await self.event("labtest-0", "opened")).status_code, 403)
+
+        # "components" (practice) rejects completion before 1 minute, then succeeds after 1 minute.
+        self.assertEqual((await self.event("components", "opened")).status_code, 200)
+        early = await self.event("components", "complete")
+        self.assertEqual(early.status_code, 422)
+        self.assertEqual(early.json()["code"], "MINIMUM_LEARNING_TIME")
+        await self.complete_lesson("components")
+
+        # Now "labtest-0" is unlocked and can also be completed after 1 minute.
+        self.assertEqual((await self.event("labtest-0", "opened")).status_code, 200)
+        early_labtest = await self.event("labtest-0", "complete")
+        self.assertEqual(early_labtest.status_code, 422)
+        self.assertEqual(early_labtest.json()["code"], "MINIMUM_LEARNING_TIME")
+        await self.complete_lesson("labtest-0")
+
+        path = await self.path()
+        self.assertTrue(path["labs"][0]["completed"])
+        self.assertEqual(path["labs"][1]["access"], "available")
 
     async def test_revoked_member_and_archived_class_cannot_write(self):
         for user in (1, 2):

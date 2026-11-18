@@ -53,6 +53,7 @@ class ClassPostgresTests(unittest.IsolatedAsyncioTestCase):
             )
             before = (await db.execute(text("SELECT * FROM lab_progress"))).mappings().one()
         await self.cli("upgrade", "head")
+        await self.engine.dispose()  # The CLI changed lab_progress; drop cached statement plans.
         await self.assert_schema_matches()
         async with self.engine.begin() as db:
             user = (
@@ -61,10 +62,9 @@ class ClassPostgresTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).one()
             self.assertEqual(tuple(user), ("legacy@example.com", "preserve", "user", "active"))
-            self.assertEqual(
-                dict((await db.execute(text("SELECT * FROM lab_progress"))).mappings().one()),
-                dict(before),
-            )
+            after = (await db.execute(text("SELECT * FROM lab_progress"))).mappings().one()
+            self.assertEqual({key: after[key] for key in before}, dict(before))
+            self.assertEqual(after["lesson_progress"], {})
             await db.execute(text("UPDATE users SET role='teacher',status='locked' WHERE id=1"))
             await db.execute(
                 text("INSERT INTO classes(id,code,name,created_by) VALUES(1,'KEEP','Keep',1)")
@@ -79,7 +79,7 @@ class ClassPostgresTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO audit_logs(actor,action,target,after) VALUES(1,'test','class:1',jsonb_build_object('kept',true))"
                 )
             )
-        await self.cli("downgrade", "-1")
+        await self.cli("downgrade", "0009_quizzes")
         async with self.engine.connect() as db:
             self.assertEqual(
                 (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one(),

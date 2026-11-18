@@ -15,7 +15,11 @@ export function AuthProvider({ children }) {
     setClassMode(null);
     if (userId) request('/api/lms/config')
       .then(config => { if (active) { setLegacyAllowed(config.legacy_allowed !== false); setClassMode(config.class_mode); } })
-      .catch(() => { if (active) setClassMode(false); });
+      .catch(() => {
+        // Never fall back to the unrestricted legacy curriculum when the
+        // server-side LMS policy cannot be verified.
+        if (active) { setLegacyAllowed(false); setClassMode(true); }
+      });
     return () => { active = false; };
   }, [userId]);
 
@@ -70,7 +74,7 @@ export function AuthProvider({ children }) {
     return () => { active = false; };
   }, []);
 
-  const login = useCallback(async (email, password, remember = false) => {
+  const login = useCallback(async (email, password, remember = true) => {
     const data = await request('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
@@ -80,17 +84,37 @@ export function AuthProvider({ children }) {
     return data.user;
   }, []);
 
-  const register = useCallback(async (email, password, fullName) => {
-    const data = await request('/api/auth/register', {
+  const loginAdmin = useCallback(async (email, password, remember = true) => {
+    const data = await request('/api/admin/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password, full_name: fullName || undefined }),
+      body: JSON.stringify({ email, password }),
     });
-    saveAuthToken(data.access_token);
+    saveAuthToken(data.access_token, remember);
     setUser(data.user);
     return data.user;
   }, []);
 
-  const loginGoogle = useCallback(async (credential, remember = false) => {
+  const registerAdmin = useCallback(async (email, password, fullName, remember = true) => {
+    const data = await request('/api/admin/signup', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, full_name: fullName || undefined }),
+    });
+    saveAuthToken(data.access_token, remember);
+    setUser(data.user);
+    return data.user;
+  }, []);
+
+  const register = useCallback(async (email, password, fullName, remember = true) => {
+    const data = await request('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, full_name: fullName || undefined }),
+    });
+    saveAuthToken(data.access_token, remember);
+    setUser(data.user);
+    return data.user;
+  }, []);
+
+  const loginGoogle = useCallback(async (credential, remember = true) => {
     const data = await request('/api/auth/google', {
       method: 'POST',
       body: JSON.stringify({ credential }),
@@ -128,7 +152,7 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider value={{
-      user, loading, login, loginGoogle, register, logout, isAuthenticated: !!user,
+      user, loading, login, loginAdmin, registerAdmin, loginGoogle, register, logout, isAuthenticated: !!user,
       classMode, legacyAllowed,
       changePassword, markVideoWatched, markDocViewed,
     }}>

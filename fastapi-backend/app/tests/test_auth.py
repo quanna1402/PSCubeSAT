@@ -7,18 +7,21 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from loguru import logger
 from sqlalchemy import Integer, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.google_auth import verify_google_credential
-from app.core.logging import configure_console_encoding
+from app.core.logging import configure_console_encoding, mask_email
 from app.core.security import create_access_token
 from app.db import get_db
 from app.models.db_models import Base, GoogleIdentity, RevokedToken, User
 from app.routers import compiler, curriculum, health
+from app.routers.admin import router as admin_router
 from app.routers.auth import router
+from app.services.auth import LOGIN_FAILURES, PAIR_FAILURES
 
 
 class AuthTests(unittest.IsolatedAsyncioTestCase):
@@ -35,6 +38,7 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         app = FastAPI()
         app.include_router(router)
+        app.include_router(admin_router)
         for service_router in [compiler.router, curriculum.router, health.router]:
             app.include_router(service_router)
         register_exception_handlers(app)
@@ -47,6 +51,7 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         self.redis_patch = patch("app.services.auth.get_redis", return_value=None)
         self.redis_patch.start()
         self.client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+        LOGIN_FAILURES.clear()
 
     async def asyncTearDown(self):
         await self.client.aclose()
@@ -71,6 +76,49 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.routers.auth.verify_google_credential", AsyncMock(return_value=claims)):
             return await self.client.post("/api/auth/google", json={"credential": "test-token"})
 
+    async def login(self, password, email="student@gmail.com"):
+        return await self.client.post(
+            "/api/auth/login", json={"email": email, "password": password}
+        )
+
+    async def test_repeated_wrong_passwords_lock_the_email_and_address_pair(self):
+        await self.register()
+        for _ in range(PAIR_FAILURES):
+            self.assertEqual((await self.login("wrong-pass")).status_code, 401)
+        locked = await self.login("secret123")
+        self.assertEqual(locked.status_code, 429, locked.text)
+        self.assertEqual(locked.json()["code"], "LOGIN_LOCKED")
+        self.assertGreater(locked.json()["details"]["retry_after"], 0)
+        # Another account from the same address is not affected.
+        await self.register("other@gmail.com")
+        self.assertEqual((await self.login("secret123", "other@gmail.com")).status_code, 200)
+
+    async def test_successful_login_clears_failures_and_unknown_email_still_runs_bcrypt(self):
+        await self.register()
+        for _ in range(PAIR_FAILURES - 1):
+            await self.login("wrong-pass")
+        self.assertEqual((await self.login("secret123")).status_code, 200)
+        self.assertEqual((await self.login("wrong-pass")).status_code, 401)
+        self.assertEqual((await self.login("secret123")).status_code, 200)
+        with patch("app.services.auth.verify_password", return_value=False) as verify:
+            self.assertEqual((await self.login("x", "nobody@gmail.com")).status_code, 401)
+        verify.assert_called_once()
+
+    async def test_auth_logs_mask_email_addresses(self):
+        self.assertEqual(mask_email(" Student@Gmail.com "), "st***@gmail.com")
+        self.assertEqual(mask_email("not-an-email"), "***")
+        lines: list[str] = []
+        sink = logger.add(lines.append, format="{message} {extra}")
+        try:
+            await self.register()
+            await self.login("secret123")
+            await self.login("wrong-pass")
+        finally:
+            logger.remove(sink)
+        text = "".join(lines)
+        self.assertIn("st***@gmail.com", text)
+        self.assertNotIn("student@gmail.com", text)
+
     async def test_register_login_and_me(self):
         registered = await self.register("Student@gmail.com")
         self.assertEqual(registered.status_code, 201, registered.text)
@@ -86,6 +134,29 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()["full_name"], "Nguyễn Văn A")
+    async def test_admin_login_requires_admin_route(self):
+        signup = await self.client.post(
+            "/api/admin/signup",
+            json={
+                "email": "admin@ptit.edu.vn",
+                "password": "secret123",
+                "full_name": "Administrator",
+            },
+        )
+        self.assertEqual(signup.status_code, 201, signup.text)
+        self.assertEqual(signup.json()["user"]["role"], "admin")
+
+        response = await self.client.post(
+            "/api/auth/login", json={"email": "admin@ptit.edu.vn", "password": "secret123"}
+        )
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertIn("quản trị", response.json()["message"].lower())
+
+        admin_login = await self.client.post(
+            "/api/admin/login", json={"email": "admin@ptit.edu.vn", "password": "secret123"}
+        )
+        self.assertEqual(admin_login.status_code, 200, admin_login.text)
+        self.assertEqual(admin_login.json()["user"]["role"], "admin")
 
     async def test_duplicate_and_deleted_email(self):
         await self.register()

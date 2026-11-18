@@ -6,11 +6,14 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from loguru import logger
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from app.core.lms_errors import LMSError
+from app.core.logging import mask_email
+from app.core.rate_limit import FixedWindowLimiter
 from app.core.redis import get_redis
 from app.core.security import (
     create_access_token,
@@ -19,7 +22,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db import get_db
-from app.models.tables import AccountStatus, GoogleIdentity, RevokedToken, User
+from app.models.tables import AccountStatus, GoogleIdentity, RevokedToken, User, UserRole
 from app.repository.user import UserRepository
 from app.schemas.auth import (
     AuthTokenResponse,
@@ -91,6 +94,15 @@ async def get_required_user(
 # ── AuthService ─────────────────────────────────────────────────────────────────
 
 
+# Brute-force guard: failures per (email, IP) lock that pair briefly; failures per email from
+# all addresses lock it longer, so a distributed guess is slowed without one IP locking a victim.
+LOGIN_FAILURES = FixedWindowLimiter()
+PAIR_FAILURES, PAIR_WINDOW_S = 5, 15 * 60
+EMAIL_FAILURES, EMAIL_WINDOW_S = 30, 60 * 60
+# Verified for unknown emails too, so response time does not reveal which emails exist.
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
+
+
 class AuthService:
     """Service xử lý toàn bộ nghiệp vụ xác thực (đăng ký, đăng nhập, đăng xuất, lấy thông tin)."""
 
@@ -104,7 +116,7 @@ class AuthService:
 
         if await self.user_repo.check_email_exists(email_clean):
             logger.warning(
-                f"[AuthService] ❌ Attempt to register with existing email: {email_clean}"
+                f"[AuthService] ❌ Attempt to register with existing email: {mask_email(email_clean)}"
             )
             raise ValueError("Email này đã được sử dụng. Vui lòng đăng nhập hoặc dùng email khác.")
 
@@ -130,7 +142,7 @@ class AuthService:
         await self.db_session.refresh(created_user)
 
         logger.success(
-            f"[AuthService] ✅ New user registered: {created_user.email} (ID: {created_user.id})"
+            f"[AuthService] ✅ New user registered: {mask_email(created_user.email)} (ID: {created_user.id})"
         )
 
         token = create_access_token(
@@ -153,20 +165,103 @@ class AuthService:
             ),
         )
 
-    async def login_user(self, request: LoginRequest) -> AuthTokenResponse:
+    async def register_first_admin(self, request: RegisterRequest) -> AuthTokenResponse:
+        """Create the bootstrap administrator only when no administrator exists."""
+        admin_count = await self.db_session.scalar(
+            select(func.count(User.id)).where(
+                User.role == UserRole.admin,
+                User.deleted_at.is_(None),
+            )
+        )
+        if admin_count:
+            raise ValueError("Tài khoản quản trị đầu tiên đã được khởi tạo.")
+
+        email_clean = request.email.strip().lower()
+        if await self.user_repo.check_email_exists(email_clean):
+            raise ValueError("Email này đã được sử dụng. Vui lòng đăng nhập hoặc dùng email khác.")
+
+        full_name = (
+            request.full_name.strip()
+            if request.full_name and request.full_name.strip()
+            else email_clean.split("@")[0]
+        )
+        new_admin = User(
+            email=email_clean,
+            password_hash=await run_in_threadpool(hash_password, request.password),
+            full_name=full_name,
+            role=UserRole.admin,
+        )
+        try:
+            created_admin = await self.user_repo.create(new_admin)
+            await self.db_session.commit()
+        except IntegrityError as exc:
+            await self.db_session.rollback()
+            raise ValueError("Email này đã được sử dụng. Vui lòng dùng email khác.") from exc
+        await self.db_session.refresh(created_admin)
+
+        token = create_access_token(
+            {
+                "sub": str(created_admin.id),
+                "email": created_admin.email,
+                "role": created_admin.role,
+            }
+        )
+        return AuthTokenResponse(
+            access_token=token,
+            token_type="bearer",
+            user=UserResponse(
+                id=created_admin.id,
+                email=created_admin.email,
+                full_name=created_admin.full_name,
+                role=created_admin.role,
+                created_at=(
+                    created_admin.created_at.isoformat()
+                    if created_admin.created_at
+                    else None
+                ),
+            ),
+        )
+
+    async def login_user(
+        self, request: LoginRequest, client_ip: str, *, require_role: UserRole | None = None
+    ) -> AuthTokenResponse:
         """Xác thực email + password, trả về JWT token nếu hợp lệ."""
         email_clean = request.email.strip().lower()
+        pair_key, email_key = f"pair:{email_clean}:{client_ip}", f"email:{email_clean}"
+        retry_after = LOGIN_FAILURES.blocked(pair_key, PAIR_FAILURES) or LOGIN_FAILURES.blocked(
+            email_key, EMAIL_FAILURES
+        )
+        if retry_after:
+            raise LMSError(
+                429,
+                "LOGIN_LOCKED",
+                f"Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau {int(retry_after + 0.999)} giây.",
+                {"retry_after": int(retry_after + 0.999)},
+            )
 
         user = await self.user_repo.get_by_email(email_clean)
-        if not user or not await run_in_threadpool(
-            verify_password, request.password, user.password_hash
-        ):
+        valid = await run_in_threadpool(
+            verify_password, request.password, user.password_hash if user else _DUMMY_HASH
+        )
+        if not user or not valid:
+            LOGIN_FAILURES.hit(pair_key, PAIR_FAILURES, PAIR_WINDOW_S)
+            if LOGIN_FAILURES.hit(email_key, EMAIL_FAILURES, EMAIL_WINDOW_S):
+                logger.bind(action="login_email_locked", email=mask_email(email_clean)).warning(
+                    "Login failures from many addresses locked an account email"
+                )
             raise ValueError("Email hoặc mật khẩu không chính xác.")
+        LOGIN_FAILURES.reset(pair_key)
 
         if user.status != AccountStatus.active:
             raise ValueError("Tài khoản đã bị khóa. Vui lòng liên hệ quản trị viên.")
 
-        logger.info(f"[AuthService] 🔑 User logged in: {user.email}")
+        if require_role is not None and user.role != require_role:
+            raise ValueError(f"Tài khoản này không có quyền truy cập {require_role.value}.")
+
+        if require_role is None and user.role == UserRole.admin:
+            raise ValueError("Tài khoản quản trị chỉ được đăng nhập từ trang quản trị.")
+
+        logger.info(f"[AuthService] 🔑 User logged in: {mask_email(user.email)} ({user.role.value})")
 
         token = create_access_token(
             {

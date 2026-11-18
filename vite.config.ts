@@ -8,6 +8,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const cert = env.DEV_HTTPS_CERT
   const key = env.DEV_HTTPS_KEY
+  const frontendPort = Number(env.VITE_DEV_PORT || 5175)
+  const backendPort = Number(env.VITE_BACKEND_PORT || 8005)
   if (Boolean(cert) !== Boolean(key)) throw new Error('Set both DEV_HTTPS_CERT and DEV_HTTPS_KEY')
   return {
   plugins: [react(), tailwindcss(), {
@@ -15,6 +17,11 @@ export default defineConfig(({ mode }) => {
     generateBundle() {
       const restricted = [...this.getModuleIds()].filter(id => /[\\/]src[\\/]data[\\/](curriculum|labs|lesson-reading)\.js(?:\?|$)/.test(id));
       if (restricted.length) this.error('Restricted curriculum seed files must not be bundled into the browser.');
+    },
+    // Dev tools (e.g. a live design overlay) must never ship a script from another origin.
+    transformIndexHtml(html) {
+      if (/<script[^>]+src=["']?(https?:)?\/\//i.test(html)) throw new Error('index.html must not load scripts from another origin.');
+      return html;
     },
   }],
   define: {
@@ -40,17 +47,17 @@ export default defineConfig(({ mode }) => {
   },
   server: {
     https: cert && key ? { cert: readFileSync(cert), key: readFileSync(key) } : undefined,
-    port: 5175,
+    port: frontendPort,
     host: true,
     strictPort: true,
     allowedHosts: true,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8005',
+        target: `http://127.0.0.1:${backendPort}`,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://127.0.0.1:8005',
+        target: `ws://127.0.0.1:${backendPort}`,
         ws: true,
       },
     },

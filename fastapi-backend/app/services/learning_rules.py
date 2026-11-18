@@ -46,24 +46,27 @@ def video_complete(segments, duration, threshold=0.9):
     return duration > 0 and watched_seconds(segments) >= duration * threshold
 
 
-def learning_path(config, states, unlocked=(), last_lesson=None, allow_waivers=True):
+def learning_path(
+    config, states, unlocked=(), last_lesson=None, allow_waivers=True, *, unlocked_all=False
+):
     labs = []
     done = {}
     for lab in config["labs"]:
         if not lab["enabled"]:
             continue
-        required = [item for item in lab["lessons"] if item["enabled"] and item["required"]]
+        enabled_lessons = [item for item in lab["lessons"] if item["enabled"]]
         count = sum(
-            satisfies(states.get(item["id"], "not_started"), allow_waivers) for item in required
+            satisfies(states.get(item["id"], "not_started"), allow_waivers)
+            for item in enabled_lessons
         )
-        done[lab["id"]] = bool(required) and count == len(required)
+        done[lab["id"]] = bool(enabled_lessons) and count == len(enabled_lessons)
         labs.append(
             {
                 "id": lab["id"],
                 "title": lab["title"],
-                "required_count": len(required),
+                "required_count": len(enabled_lessons),
                 "completed_count": count,
-                "percent": round(100 * count / len(required), 2) if required else 0,
+                "percent": round(100 * count / len(enabled_lessons), 2) if enabled_lessons else 0,
                 "completed": done[lab["id"]],
                 "prerequisites": lab["prerequisites"],
                 "lessons": [
@@ -74,14 +77,18 @@ def learning_path(config, states, unlocked=(), last_lesson=None, allow_waivers=T
                         "required": item["required"],
                         "status": states.get(item["id"], "not_started"),
                     }
-                    for item in lab["lessons"]
-                    if item["enabled"]
+                    for item in enabled_lessons
                 ],
             }
         )
+    all_previous_completed = True
     for lab in labs:
-        missing = [value for value in lab["prerequisites"] if not done.get(value, False)]
-        available = not missing or lab["id"] in unlocked or lab["completed"]
+        missing = (
+            []
+            if unlocked_all
+            else [value for value in lab["prerequisites"] if not done.get(value, False)]
+        )
+        available = unlocked_all or not missing or lab["id"] in unlocked or lab["completed"]
         lab.update(
             access="available" if available else "locked",
             missing_prerequisites=missing,
@@ -89,12 +96,32 @@ def learning_path(config, states, unlocked=(), last_lesson=None, allow_waivers=T
             if available
             else "Cần hoàn thành " + ", ".join(f"Lab {value}" for value in missing),
         )
+        lab_prev_completed = (
+            True if (unlocked_all or lab["id"] in unlocked) else all_previous_completed
+        )
+        for lesson in lab["lessons"]:
+            completed = satisfies(lesson["status"], allow_waivers)
+            lesson_missing = []
+            if not unlocked_all:
+                if not available:
+                    lesson_missing.append(lab["reason"])
+                elif not lab_prev_completed:
+                    lesson_missing.append("Bạn cần hoàn thành bài học trước để mở khóa bài này.")
+            lesson.update(
+                access="locked" if lesson_missing else "completed" if completed else "available",
+                reason="; ".join(lesson_missing),
+            )
+            if not completed:
+                lab_prev_completed = False
+                all_previous_completed = False
     candidates = [
         item
         for lab in labs
         if lab["access"] == "available"
         for item in lab["lessons"]
-        if not satisfies(item["status"], allow_waivers) and item["status"] != "pending_review"
+        if item["access"] == "available"
+        and not satisfies(item["status"], allow_waivers)
+        and item["status"] != "pending_review"
     ]
     resume = next((item["id"] for item in candidates if item["id"] == last_lesson), None)
     if resume is None and candidates:

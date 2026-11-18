@@ -4,7 +4,7 @@ import { TOKEN_KEY, getAuthToken, saveAuthToken, clearAuthToken } from '../src/c
 import { loginDestination, tokenExpiresAt } from '../src/contexts/auth-session.js';
 
 test('login destination stays internal and preserves the selected exercise', () => {
-  for (const path of ['/', '/profile', '/lab0', '/lab8?lesson=Lab8-01_Custom_Mission', '/lab6?lesson=Lab6-01_Multitasking_Scheduler#editor']) assert.equal(loginDestination(path), path);
+  for (const path of ['/', '/profile', '/lab0', '/lab8?lesson=Lab8-01_Custom_Mission', '/lab3?lesson=Lab3-03_Multitasking_Scheduler#editor']) assert.equal(loginDestination(path), path);
   for (const path of [undefined, null, '//evil.test', 'https://evil.test', '/login', '/lab9', '/lab1/../../evil', '/\\evil']) assert.equal(loginDestination(path), '/');
 });
 
@@ -39,6 +39,26 @@ test('remember choice controls persistence and switching/logging out removes old
     clearAuthToken();
     assert.equal(getAuthToken(), null);
   } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
+    }
+  }
+});
+
+test('persistent storage is available to a newly opened tab', () => {
+  const memoryStorage = () => {
+    const values = new Map();
+    return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) };
+  };
+  const previous = { localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage };
+  globalThis.localStorage = memoryStorage();
+  globalThis.sessionStorage = memoryStorage();
+  try {
+    saveAuthToken('default-persistent', true);
+    assert.equal(localStorage.getItem(TOKEN_KEY), 'default-persistent');
+    assert.equal(sessionStorage.getItem(TOKEN_KEY), null);
+  } finally {
+    clearAuthToken();
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
     }

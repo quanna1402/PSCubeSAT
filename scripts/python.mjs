@@ -13,7 +13,7 @@ const candidates = [
   ...(process.env.CONDA_PREFIX ? [join(process.env.CONDA_PREFIX, process.platform === 'win32' ? 'python.exe' : 'bin/python')] : []),
   ...(process.platform === 'win32' ? [join(homedir(), 'miniconda3', 'envs', 'stemcube', 'python.exe')] : []),
 ];
-const executable = process.env.PSCUBESAT_PYTHON || candidates.find(path => existsSync(path)) || (process.platform === 'win32' ? 'python' : 'python3');
+const executable = process.env.PSCUBESAT_PYTHON || candidates.find(path => existsSync(path)) || (process.platform === 'win32' ? 'py' : 'python3');
 const result = spawnSync(executable, process.argv.slice(2), { stdio: 'inherit' });
 if (result.error) {
   process.stderr.write('Cannot start Python. Activate a virtual environment or set PSCUBESAT_PYTHON.\n');
